@@ -1,0 +1,7 @@
+.venv/
+.upstream/
+__pycache__/
+*.sqlite3*
+profiles/
+browser.lock
+.local/
