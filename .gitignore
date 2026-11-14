@@ -1,7 +1,19 @@
 .venv/
 .upstream/
 __pycache__/
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
 *.sqlite3*
 profiles/
 browser.lock
 .local/
+
+# 本机验收记录可能包含账号信息，保留在本地。
+/本次*.diff
+/最后一轮*.diff
+/本次完善_验收报告_*.md
+/最后一轮_安全运营验收_*.md
+/验收报告.md
