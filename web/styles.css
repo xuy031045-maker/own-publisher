@@ -218,8 +218,8 @@ a { color: inherit; }
   display: flex;
   align-items: center;
   gap: var(--s-3);
-  height: 34px;
-  padding: 0 var(--s-2);
+  height: 38px;
+  padding: 0 10px;
   border-radius: var(--r-2);
   color: var(--ink-3);
   font-size: var(--fs-sm);
@@ -230,7 +230,7 @@ a { color: inherit; }
 .rail nav a:hover { background: var(--surface-2); color: var(--ink-1); }
 .rail nav a[aria-current] { background: var(--surface-3); color: var(--ink-1); }
 
-.nav-icon { width: 17px; height: 17px; flex: none; opacity: 0.72; }
+.nav-icon { width: 18px; height: 18px; flex: none; stroke-width: 1.6; opacity: 0.76; }
 .rail nav a[aria-current] .nav-icon { opacity: 1; }
 
 .rail-foot {
@@ -354,8 +354,9 @@ small, .muted { color: var(--ink-3); font-size: var(--fs-xs); font-weight: var(-
   color: var(--ink-3);
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
-.icon-button svg { width: 16px; height: 16px; }
+.icon-button svg, .ui-icon { width: 16px; height: 16px; flex: none; stroke-width: 1.6; }
 .icon-button:hover { background: var(--surface-3); color: var(--ink-1); }
+.icon-text { display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
 
 /* 主题按钮里两个图标的显隐 */
 :root[data-theme="light"] .icon-moon { display: none; }
@@ -536,6 +537,7 @@ input[type=radio]:checked::after {
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
 .image-actions button:hover:enabled { background: var(--surface-3); color: var(--ink-1); }
+.image-actions .ui-icon { width: 15px; height: 15px; }
 
 .target-list { display: grid; gap: 6px; margin-bottom: var(--s-3); max-height: 268px; overflow: auto; }
 .target-row, .account-row {
@@ -832,6 +834,8 @@ dd { margin: 0; color: var(--ink-2); }
   font-size: var(--fs-xs);
 }
 .inbox-account-chip.needs-attention { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn); }
+.inbox-account-chip strong { font-weight: var(--wt-semi); }
+.inbox-account-chip small, .inbox-account-alias { color: var(--ink-3); font-size: var(--fs-xs); }
 
 .inbox-toolbar { display: grid; grid-template-columns: minmax(160px, 1fr) 176px 140px; gap: var(--s-2); margin: var(--s-3) 0; }
 
@@ -850,6 +854,21 @@ dd { margin: 0; color: var(--ink-2); }
 .inbox-list-heading { display: flex; align-items: center; justify-content: space-between; padding: var(--s-3) var(--s-4); border-bottom: 1px solid var(--line-soft); font-size: var(--fs-sm); }
 .inbox-list-heading strong { font-weight: var(--wt-med); }
 .inbox-list-heading span { color: var(--ink-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.inbox-bulk-link { border: 0; padding: 4px 0; background: transparent; color: var(--accent); font-size: var(--fs-xs); cursor: pointer; }
+.inbox-bulk-link:hover { text-decoration: underline; }
+.inbox-bulk-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+.inbox-bulk-link:disabled { opacity: .5; cursor: wait; }
+.inbox-bulk-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 10px; padding: var(--s-2) var(--s-4); border-bottom: 1px solid var(--line); background: var(--surface-2); font-size: var(--fs-xs); }
+.inbox-bulk-bar > div { display: flex; align-items: center; gap: 10px; }
+.inbox-bulk-bar span { color: var(--ink-3); white-space: nowrap; }
+.inbox-bulk-bar .inbox-bulk-delete { height: var(--control-h-sm); padding: 0 var(--s-2); color: var(--danger); font-size: var(--fs-xs); }
+.inbox-bulk-bar .inbox-bulk-delete:disabled { color: var(--ink-3); }
+.inbox-item-row { display: flex; align-items: center; min-width: 0; }
+.inbox-item-row .inbox-item { flex: 1; min-width: 0; }
+.inbox-item-row.selecting { padding-left: var(--s-3); }
+.inbox-item-row.selecting .inbox-item { padding-left: var(--s-2); }
+.inbox-select { display: inline-flex; align-items: center; justify-content: center; flex: none; padding: 4px; }
+.inbox-select input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
 .inbox-list { flex: 1; overflow: auto; }
 
 .inbox-item {
@@ -916,14 +935,21 @@ dd { margin: 0; color: var(--ink-2); }
 .inbox-thread-head small { display: block; margin-top: 3px; color: var(--ink-3); font-size: var(--fs-xs); }
 .inbox-thread-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .inbox-thread-actions .secondary { height: var(--control-h-sm); padding: 0 var(--s-2); font-size: var(--fs-xs); }
+.inbox-thread-actions .delete-thread { color: var(--danger); }
+.inbox-thread-actions .delete-thread:hover { background: var(--danger-bg); border-color: var(--danger-line); color: var(--danger); }
+.inbox-message-bulk { padding-left: var(--s-5); padding-right: var(--s-5); }
 .inbox-thread-warning { padding: var(--s-2) var(--s-5); background: var(--warn-bg); color: var(--warn); font-size: var(--fs-xs); line-height: var(--lh-base); }
 
 .inbox-messages { flex: 1; min-height: 0; overflow: auto; padding: var(--s-5); }
 .inbox-message { display: flex; flex-direction: column; align-items: flex-start; margin-bottom: var(--s-4); }
 .inbox-message.outgoing { align-items: flex-end; }
 .inbox-message small { margin-bottom: 4px; color: var(--ink-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.inbox-message-content { display: flex; align-items: center; gap: var(--s-1); max-width: min(84%, 610px); }
+.inbox-message.outgoing .inbox-message-content { flex-direction: row-reverse; }
+.delete-message { flex: none; opacity: 0.65; }
+.delete-message:hover, .delete-message:focus-visible { color: var(--danger); background: var(--danger-bg); opacity: 1; }
 .inbox-bubble {
-  max-width: min(78%, 560px);
+  max-width: 100%; min-width: 0;
   padding: var(--s-2) var(--s-3);
   border: 1px solid var(--line);
   border-radius: 3px var(--r-4) var(--r-4) var(--r-4);
@@ -970,8 +996,8 @@ dd { margin: 0; color: var(--ink-2); }
   .brand { padding: 0 0 var(--s-3); }
   .rail nav { display: flex; gap: 2px; overflow-x: auto; padding-bottom: var(--s-2); padding-right: var(--s-4); scrollbar-width: none; }
   .rail nav::-webkit-scrollbar { display: none; }
-  .rail nav a { height: 44px; padding: 0 6px; font-size: var(--fs-xs); white-space: nowrap; }
-  .nav-icon { display: none; }
+  .rail nav a { height: 44px; padding: 0 8px; gap: 6px; font-size: var(--fs-xs); white-space: nowrap; }
+  .nav-icon { display: block; width: 16px; height: 16px; }
   .rail nav a[aria-current] { background: var(--surface-3); }
   .rail-foot { display: none; }
 

@@ -220,8 +220,9 @@ def status():
         result['broken'] = _main_generation() != state['generation']
         result['pending'] |= result['broken']
         with db() as main:
-            accounts = main.execute('''SELECT a.alias,a.platform,a.label,COALESCE(i.identity_hash,'') AS identity_hash
-                    FROM accounts a LEFT JOIN account_identities i ON i.alias=a.alias ORDER BY a.alias''').fetchall()
+            accounts = main.execute('''SELECT a.alias,a.platform,a.label,p.nickname,COALESCE(i.identity_hash,'') AS identity_hash
+                    FROM accounts a LEFT JOIN account_identities i ON i.alias=a.alias
+                    LEFT JOIN account_profiles p ON p.alias=a.alias ORDER BY a.alias''').fetchall()
         output = []
         for account in accounts:
             audit = con.execute('''SELECT checked_at,note_count FROM restore_audits
@@ -231,6 +232,7 @@ def status():
                          WHERE generation=? AND alias=? AND identity_hash=? ORDER BY title,note_id''',
                                 (state['generation'],account['alias'],account['identity_hash'])).fetchall() if audit else []
             output.append({'alias':account['alias'],'platform':account['platform'],'label':account['label'],
+                           'nickname':account['nickname'],
                            'identity_verified':bool(account['identity_hash']),'audited':bool(audit),
                            'note_count':audit['note_count'] if audit else None,
                            'checked_at':audit['checked_at'] if audit else None,'notes':[dict(n) for n in notes]})

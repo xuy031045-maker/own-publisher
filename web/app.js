@@ -16,6 +16,19 @@ const platformStates = {scheduled: '显示排期', published: '显示已发布',
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 })[ch]);
+const hasVerifiedNickname = account => !!(account?.identity_verified && typeof account.nickname === 'string' && account.nickname.trim());
+function accountName(account) { return hasVerifiedNickname(account) ? account.nickname.trim() : '未核验'; }
+function accountCaption(account) {
+  return `${account?.alias || ''}${hasVerifiedNickname(account) ? '' : ' · 请先检查账号'}`;
+}
+const iconPaths = {
+  left: '<path d="M15 6l-6 6 6 6"/>',
+  right: '<path d="M9 6l6 6-6 6"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  trash: '<path d="M4 7h16M10 3h4M7 7l1 12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-12M10 11v6M14 11v6"/>',
+  star: '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"/>'
+};
+const uiIcon = name => `<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${iconPaths[name] || ''}</svg>`;
 function checkedTime(value) {
   if (!value) return '尚未核验';
   const date = new Date(value.replace(' ', 'T') + 'Z');
@@ -73,7 +86,7 @@ async function refreshRestoreGuard() {
     return;
   }
   $('#restore-review-list').innerHTML = result.accounts.map(account => {
-    const label = escapeHtml(account.label || account.alias);
+    const label = `${escapeHtml(accountName(account))} <small>${escapeHtml(accountCaption(account))}</small>`;
     const detail = account.audited ? (account.note_count < 0 ? '已人工核对' : `已读取 ${account.note_count} 条平台作品`) :
       (account.platform === 'xiaohongshu' && !account.identity_verified ? '请先检查账号身份' : '尚未核对');
     const action = account.platform === 'xiaohongshu' ?
@@ -149,15 +162,15 @@ async function refreshAccounts() {
   const empty = '<p class="empty">还没有账号，请先登记并登录。</p>';
   $('#target-list').innerHTML = state.accounts.map(account => `
     <label class="target-row"><input type="checkbox" value="${escapeHtml(account.alias)}" ${selected.has(account.alias) ? 'checked' : ''}>
-    <span class="avatar">${escapeHtml((account.label || account.alias).slice(0, 1))}</span>
-    <span class="target-text"><strong>${escapeHtml(account.label)}</strong><small>${escapeHtml(account.alias)}${account.nickname ? ` · 上次核验 ${escapeHtml(account.nickname)}` : ''}${account.identity_verified ? '' : ' · 请先检查账号'}</small></span></label>`).join('') || empty;
+    <span class="avatar">${escapeHtml(accountName(account).slice(0, 1))}</span>
+    <span class="target-text"><strong>${escapeHtml(accountName(account))}</strong><small>${escapeHtml(accountCaption(account))}</small></span></label>`).join('') || empty;
   $('#account-list').innerHTML = state.accounts.map(account => `
-    <div class="account-row"><span class="avatar">${escapeHtml((account.label || account.alias).slice(0, 1))}</span>
-    <span class="target-text"><strong>${escapeHtml(account.label)}</strong><small>${escapeHtml(account.alias)}${account.nickname ? ` · ${escapeHtml(account.nickname)}` : ''} · ${escapeHtml(checkedTime(account.checked_at))}${account.identity_verified ? '' : ' · 请先检查账号'}</small><small>${account.note ? `备注：${escapeHtml(account.note)}` : '暂无备注'}</small></span>
+    <div class="account-row"><span class="avatar">${escapeHtml(accountName(account).slice(0, 1))}</span>
+    <span class="target-text"><strong>${escapeHtml(accountName(account))}</strong><small>${escapeHtml(accountCaption(account))} · ${escapeHtml(checkedTime(account.checked_at))}</small><small>${account.note ? `备注：${escapeHtml(account.note)}` : '暂无备注'}${account.label && account.label !== account.alias ? ` · 标签：${escapeHtml(account.label)}` : ''}</small></span>
     <div class="row-actions">${state.accountJobs[account.alias] ? `<button class="secondary" data-cancel-job="${escapeHtml(state.accountJobs[account.alias])}">取消登录</button>` : `<button class="secondary" data-account="${escapeHtml(account.alias)}" data-action="login">登录</button>
     <button class="secondary" data-account="${escapeHtml(account.alias)}" data-action="check">检查</button><button class="secondary" data-note="${escapeHtml(account.alias)}">备注</button>`}</div></div>`).join('') || empty;
   const selectedAccount = $('#history-account').value;
-  $('#history-account').innerHTML = '<option value="">全部账号</option>' + state.accounts.map(account => `<option value="${escapeHtml(account.alias)}">${escapeHtml(account.label)} (${escapeHtml(account.alias)})</option>`).join('');
+  $('#history-account').innerHTML = '<option value="">全部账号</option>' + state.accounts.map(account => `<option value="${escapeHtml(account.alias)}">${escapeHtml(accountName(account))}（${escapeHtml(accountCaption(account))}）</option>`).join('');
   $('#history-account').value = selectedAccount;
   updateTargetCount();
 }
@@ -180,7 +193,7 @@ $('#account-list').addEventListener('click', async event => {
   if (noteButton) {
     const account = state.accounts.find(item => item.alias === noteButton.dataset.note);
     if (!account) return;
-    const note = window.prompt(`编辑 ${account.label} 的备注（最多 120 字）`, account.note || '');
+    const note = window.prompt(`编辑 ${accountName(account)}（${account.alias}）的备注（最多 120 字）`, account.note || '');
     if (note === null) return;
     try { await post(`/api/accounts/${encodeURIComponent(account.alias)}/note`, {note}); await refreshAccounts(); notify('账号备注已保存。'); }
     catch (error) { notify(error.message, true); }
@@ -207,7 +220,7 @@ $('#account-list').addEventListener('click', async event => {
       notify('请在 Edge 窗口登录；等待超过 10 分钟会自动结束。');
     }
     const job = await waitJob(result.job);
-    if (job.result.state === 'ready') notify(`${alias} 已进入创作者图文页。`);
+    if (job.result.state === 'ready') notify(`${job.result.nickname || accountName(state.accounts.find(item => item.alias === alias))}（${alias}）已进入创作者图文页。`);
     else notify(job.result.detail || '未能确认登录状态，请重试。', true);
   } catch (error) { notify(error.message, true); }
   finally {
@@ -223,7 +236,7 @@ function renderIndividual() {
   $('#individual-list').innerHTML = aliases.map(alias => {
     const account = state.accounts.find(item => item.alias === alias);
     const item = state.individual[alias] ||= {textEnabled: false, initialized: false, title: '', body: '', tags: '', timing: 'inherit', schedule: ''};
-    return `<details class="individual" data-individual="${escapeHtml(alias)}"><summary><strong>${escapeHtml(account?.label || alias)}</strong><span>${item.textEnabled || item.timing !== 'inherit' ? '已单独设置' : '使用共用内容'}</span></summary>
+    return `<details class="individual" data-individual="${escapeHtml(alias)}"><summary><strong>${escapeHtml(accountName(account))} <small>${escapeHtml(alias)}</small></strong><span>${item.textEnabled || item.timing !== 'inherit' ? '已单独设置' : '使用共用内容'}</span></summary>
       <label class="check"><input type="checkbox" data-account-field="textEnabled" ${item.textEnabled ? 'checked' : ''}>单独编辑文字</label>
       <div class="individual-text" ${item.textEnabled ? '' : 'hidden'}><label class="field"><span>标题</span><input maxlength="20" data-account-field="title" value="${escapeHtml(item.title)}"></label>
       <label class="field"><span>正文</span><textarea maxlength="1000" rows="4" data-account-field="body">${escapeHtml(item.body)}</textarea></label>
@@ -257,9 +270,9 @@ function renderImages() {
   $('#images').innerHTML = state.images.map((item, index) => `
     <div class="image-tile"><button type="button" class="image-open" data-image-src="${escapeHtml(item.url)}" data-image-name="${escapeHtml(item.name)}" aria-label="查看完整图片 ${index + 1}"><img src="${escapeHtml(item.url)}" alt=""></button>
     <div class="image-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
-    <div class="image-actions"><button type="button" data-index="${index}" data-move="-1" ${index === 0 ? 'disabled' : ''} aria-label="前移图片">←</button>
-    <button type="button" data-index="${index}" data-move="1" ${index === state.images.length - 1 ? 'disabled' : ''} aria-label="后移图片">→</button>
-    <button type="button" data-index="${index}" data-remove aria-label="移除图片">×</button></div></div>`).join('');
+    <div class="image-actions"><button type="button" data-index="${index}" data-move="-1" ${index === 0 ? 'disabled' : ''} aria-label="前移图片">${uiIcon('left')}</button>
+    <button type="button" data-index="${index}" data-move="1" ${index === state.images.length - 1 ? 'disabled' : ''} aria-label="后移图片">${uiIcon('right')}</button>
+    <button type="button" data-index="${index}" data-remove aria-label="移除图片">${uiIcon('close')}</button></div></div>`).join('');
 }
 async function addImages(files) {
   if (!files.length) return;
@@ -393,7 +406,7 @@ function openPreview(batch) {
       const approval = canRepeat(task) && canAttempt(task) ? `<label class="check"><input type="checkbox" data-duplicate-consent="${escapeHtml(task.alias)}">${titleOnly ? '我已核对平台同名作品，确认不是重复' : '我确认此账号需要再次发布相同图文'}</label>` : '';
       duplicateNote = `<div class="duplicate-warning"><p>${escapeHtml(explanation)}</p><small>相关批次：${matches.map(match => escapeHtml(match.batch)).join('、')}</small>${approval}</div>`;
     }
-    return `<article class="preview-card"><div class="preview-title"><div class="preview-account"><strong>${escapeHtml(task.label || task.alias)}</strong><small>${escapeHtml(task.alias)}${task.nickname ? ` · 上次核验 ${escapeHtml(task.nickname)}` : ''}</small></div><span>${escapeHtml(states[task.state] || task.state)}</span></div>
+    return `<article class="preview-card"><div class="preview-title"><div class="preview-account"><strong>${escapeHtml(accountName(task))}</strong><small>${escapeHtml(accountCaption(task))}</small></div><span>${escapeHtml(states[task.state] || task.state)}</span></div>
       <h3>${escapeHtml(content.title)}</h3><p class="preview-body">${escapeHtml(content.body)}</p>
       <p class="muted">${(content.tags || []).map(tag => `#${escapeHtml(tag)}`).join(' ')}</p><div class="preview-images">${pictures}</div>
       <dl><dt>发布时间</dt><dd>${content.schedule ? `北京时间 ${escapeHtml(content.schedule.replace('T', ' '))}` : '立即发布'}</dd>
@@ -503,7 +516,7 @@ $('#verification-cancel').addEventListener('click', async () => {
 
 function batchRow(batch) {
   const tasks = batch.tasks || [];
-  const rows = tasks.map(task => `<div class="record-task"><span>${escapeHtml(task.label || task.alias)}</span>
+  const rows = tasks.map(task => `<div class="record-task"><span class="record-account"><strong>${escapeHtml(accountName(task))}</strong> <small>${escapeHtml(accountCaption(task))}</small></span>
     <span class="status status-${escapeHtml(task.state)}">${escapeHtml(states[task.state] || task.state)}</span>
     ${task.schedule ? `<span>北京时间 ${escapeHtml(task.schedule.replace('T', ' '))}</span>` : ''}
     ${task.platform_result ? `<small>平台列表：${escapeHtml(platformStates[task.platform_result.status] || '状态未确认')} · 作品 ID ${escapeHtml(task.platform_result.note_id)} · ${escapeHtml(checkedTime(task.platform_result.checked_at))}</small>` : (['submitted', 'uncertain'].includes(task.state) ? `<small>${task.identity_verified ? '平台作品状态尚未核对' : '旧记录没有账号身份快照，请手动核对平台作品'}</small>` : '')}
@@ -534,7 +547,7 @@ function renderHistory() {
   const alias = $('#history-account').value, selectedState = $('#history-state').value;
   const visible = state.batches.map(batch => ({...batch, tasks: batch.tasks.filter(task =>
     (!alias || task.alias === alias) && (!selectedState || task.state === selectedState) &&
-    (!query || [batch.batch, task.alias, task.label, task.title, task.detail].some(value => String(value || '').toLowerCase().includes(query)))
+    (!query || [batch.batch, task.alias, task.nickname, task.label, task.title, task.detail].some(value => String(value || '').toLowerCase().includes(query)))
   )})).filter(batch => batch.tasks.length);
   $('#history-list').innerHTML = visible.map(batchRow).join('') || '<p class="empty">没有符合条件的记录。</p>';
 }
@@ -563,7 +576,9 @@ for (const list of [$('#history-list'), $('#plan-list')]) list.addEventListener(
     if (button.dataset.cancelVerification) await stopVerification(button.dataset.cancelVerification);
     if (button.dataset.reconcile) {
       const label = button.dataset.outcome === 'submitted' ? '已提交' : '未提交';
-      if (!window.confirm(`请先在小红书笔记管理核对。确认账号 ${button.dataset.alias} 的这条笔记${label}吗？`)) return;
+      const task = state.batches.find(batch => batch.batch === button.dataset.reconcile)?.tasks
+        .find(item => item.alias === button.dataset.alias) || {alias: button.dataset.alias};
+      if (!window.confirm(`请先在小红书笔记管理核对。确认账号 ${accountName(task)}（${accountCaption(task)}）的这条笔记${label}吗？`)) return;
       await post(`/api/batches/${encodeURIComponent(button.dataset.reconcile)}/reconcile`, {alias: button.dataset.alias, outcome: button.dataset.outcome});
       await refreshBatches();
       notify('已记录核对结果。');

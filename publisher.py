@@ -147,6 +147,10 @@ def save_account_identity(alias, nickname, identity_hash):
                 INSERT INTO account_profiles(alias, nickname) VALUES (?, ?)
                 ON CONFLICT(alias) DO UPDATE SET nickname=excluded.nickname, checked_at=CURRENT_TIMESTAMP
             """, (alias, nickname))
+        else:
+            # A newly verified identity without a nickname must not inherit the
+            # previous account's display name.
+            con.execute('DELETE FROM account_profiles WHERE alias=?', (alias,))
         con.execute("""
             INSERT INTO account_identities(alias, identity_hash) VALUES (?, ?)
             ON CONFLICT(alias) DO UPDATE SET identity_hash=excluded.identity_hash, checked_at=CURRENT_TIMESTAMP

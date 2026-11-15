@@ -178,9 +178,19 @@ def message_conversations(alias: str = '', query: str = '', status: str = 'all',
     return inbox.list_conversations(alias=alias, query=query, status=status, limit=limit, offset=offset)
 
 
+@app.get('/api/inbox/conversation-selection')
+def message_conversation_selection(alias: str = '', query: str = '', status: str = 'all'):
+    return inbox.conversation_selection(alias=alias,query=query,status=status)
+
+
 @app.get('/api/inbox/conversations/{identifier}')
 def message_conversation(identifier: int, limit: int = 200, offset: int = 0):
     return inbox.conversation(identifier, limit=limit, offset=offset)
+
+
+@app.get('/api/inbox/conversations/{identifier}/message-selection')
+def message_batch_selection(identifier: int):
+    return inbox.message_selection(identifier)
 
 
 @app.get('/api/inbox/media/{identifier}')
@@ -205,6 +215,45 @@ async def message_acknowledge(identifier: int, request: Request):
     if not isinstance(data, dict) or set(data) != {'alerts'}:
         raise ValueError('提醒信息无效。')
     return inbox.acknowledge_alerts(identifier, data['alerts'])
+
+
+@app.post('/api/inbox/conversations/{identifier}/delete-message')
+async def message_delete(identifier: int, request: Request):
+    data = await request.json()
+    if (not isinstance(data, dict) or set(data) != {'confirm','message_id','platform_message_id'} or
+            data['confirm'] != 'delete'):
+        raise ValueError('请确认删除这条本地消息。')
+    with browser_lock():
+        return inbox.delete_message(identifier,data['message_id'],data['platform_message_id'])
+
+
+@app.post('/api/inbox/conversations/{identifier}/delete-messages')
+async def message_batch_delete(identifier: int, request: Request):
+    data = await request.json()
+    if not isinstance(data,dict) or set(data) != {'confirm','messages'} or data['confirm'] != 'delete':
+        raise ValueError('请确认批量删除本地消息。')
+    with browser_lock():
+        return inbox.delete_messages(identifier,data['messages'])
+
+
+@app.post('/api/inbox/delete-conversations')
+async def conversation_batch_delete(request: Request):
+    data = await request.json()
+    if not isinstance(data,dict) or set(data) != {'confirm','conversations'} or data['confirm'] != 'delete':
+        raise ValueError('请确认批量删除本地会话。')
+    with browser_lock():
+        return inbox.delete_conversations(data['conversations'])
+
+
+@app.post('/api/inbox/conversations/{identifier}/delete')
+async def conversation_delete(identifier: int, request: Request):
+    data = await request.json()
+    if (not isinstance(data, dict) or set(data) != {'confirm','messages_version','alerts_version'} or
+            data['confirm'] != 'delete'):
+        raise ValueError('请确认删除本地会话。')
+    with browser_lock():
+        return inbox.delete_conversation(identifier,messages_version=data['messages_version'],
+                                         alerts_version=data['alerts_version'])
 
 
 @app.post('/api/inbox/conversations/{identifier}/open')

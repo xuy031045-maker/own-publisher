@@ -21,6 +21,7 @@ MAX_HISTORY_PAGES = 200
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_CONVERSATION_MEDIA_BYTES = 64 * 1024 * 1024
+MAX_BATCH_DELETE = 10000
 QUICK_RECHECK_SECONDS = 3 * 60 * 60
 
 
@@ -48,6 +49,15 @@ def ensure_schema(con):
             direction TEXT NOT NULL, content_type TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
             time_label TEXT NOT NULL DEFAULT '', timestamp_ms INTEGER, position INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(conversation_id, external_id)
+        );
+        CREATE TABLE IF NOT EXISTS inbox_message_deletions (
+            conversation_id INTEGER NOT NULL REFERENCES inbox_conversations(id),
+            message_external_id TEXT NOT NULL, deleted_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(conversation_id, message_external_id)
+        );
+        CREATE TABLE IF NOT EXISTS inbox_conversation_deletions (
+            conversation_id INTEGER PRIMARY KEY REFERENCES inbox_conversations(id),
+            deleted_at_ms INTEGER NOT NULL, hidden INTEGER NOT NULL DEFAULT 1 CHECK(hidden IN (0,1))
         );
         CREATE TABLE IF NOT EXISTS inbox_accounts (
             alias TEXT PRIMARY KEY REFERENCES accounts(alias), state TEXT NOT NULL,
@@ -101,8 +111,32 @@ def ensure_schema(con):
         );
         CREATE INDEX IF NOT EXISTS inbox_messages_order ON inbox_messages(conversation_id, timestamp_ms, position);
         CREATE INDEX IF NOT EXISTS inbox_conversations_account ON inbox_conversations(alias, identity_hash);
+        CREATE INDEX IF NOT EXISTS inbox_conversations_identity_thread ON inbox_conversations(identity_hash, external_id);
         CREATE INDEX IF NOT EXISTS inbox_alerts_unseen ON inbox_alerts(conversation_id, acknowledged, kind);
     ''')
+
+
+# These predicates are shared by the workbench and MCP reads. The records are
+# retained locally as tombstones; neither a search nor an old media URL may
+# reveal them after the user deletes them from the inbox.
+_VISIBLE_CONVERSATION = '''NOT EXISTS (SELECT 1 FROM inbox_conversation_deletions dc
+    WHERE dc.conversation_id=c.id AND dc.hidden=1)'''
+_VISIBLE_MESSAGE = '''NOT EXISTS (SELECT 1 FROM inbox_message_deletions dm
+    WHERE dm.conversation_id=m.conversation_id AND dm.message_external_id=m.external_id)
+    AND NOT EXISTS (SELECT 1 FROM inbox_conversation_deletions dc
+    WHERE dc.conversation_id=m.conversation_id
+      AND (m.timestamp_ms IS NULL OR m.timestamp_ms<=dc.deleted_at_ms))'''
+
+
+def _refresh_visible_preview(con, conversation_id):
+    row = con.execute('''SELECT m.body,m.time_label,m.timestamp_ms FROM inbox_messages m
+        JOIN inbox_message_proofs p ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
+        WHERE m.conversation_id=? AND ''' + _VISIBLE_MESSAGE + '''
+        ORDER BY CASE WHEN m.timestamp_ms IS NULL THEN 1 ELSE 0 END DESC,
+                 m.timestamp_ms DESC,m.position DESC,m.external_id DESC LIMIT 1''', (conversation_id,)).fetchone()
+    con.execute('''UPDATE inbox_conversations SET last_preview=?,last_time_label=?,last_timestamp_ms=? WHERE id=?''',
+                (row['body'] if row else '', row['time_label'] if row else '',
+                 row['timestamp_ms'] if row else None, conversation_id))
 
 
 def current_identity(con, alias):
@@ -473,17 +507,23 @@ def _reuse_unchanged_conversation(alias, identity, item):
     now = int(time.time() * 1000)
     with db() as con:
         ensure_schema(con)
+        con.execute('BEGIN IMMEDIATE')
         if current_identity(con,alias) != identity:
             raise IdentityMismatch('账号身份发生变化，已停止同步。')
-        row = con.execute('''SELECT c.id,c.history_complete,q.signature,q.verified_at_ms
+        row = con.execute('''SELECT c.id,c.history_complete,q.signature,q.verified_at_ms,
+                    EXISTS(SELECT 1 FROM inbox_message_deletions d WHERE d.conversation_id=c.id)
+                      OR EXISTS(SELECT 1 FROM inbox_conversation_deletions d WHERE d.conversation_id=c.id) AS has_deletions
                     FROM inbox_conversations c JOIN inbox_quick_checkpoints q ON q.conversation_id=c.id
                     WHERE c.alias=? AND c.identity_hash=? AND c.external_id=?''',
                     (alias,identity,item['external_id'])).fetchone()
         if not row or row['signature'] != signature or not 0 <= now-row['verified_at_ms'] <= QUICK_RECHECK_SECONDS*1000:
             return None
-        con.execute('''UPDATE inbox_conversations SET location=?,display_name=?,last_preview=?,last_time_label=?,
+        con.execute('''UPDATE inbox_conversations SET location=?,display_name=?,
+                       last_preview=CASE WHEN ? THEN last_preview ELSE ? END,
+                       last_time_label=CASE WHEN ? THEN last_time_label ELSE ? END,
                        unread_before=?,synced_at=CURRENT_TIMESTAMP WHERE id=?''',
-                    (item['location'],item['display_name'],item['last_preview'],item['last_time_label'],
+                    (item['location'],item['display_name'],row['has_deletions'],item['last_preview'],
+                     row['has_deletions'],item['last_time_label'],
                      item['unread_before'],row['id']))
         return {'history_complete':bool(row['history_complete'])}
 
@@ -506,7 +546,7 @@ def _ensure_alert_anchor(con, conversation_id):
 
 
 def _save_conversation(alias, identity, item, messages, timestamps, complete, pages, media=None,
-                       observations=None, account_cutoff_ms=None):
+                       observations=None, account_cutoff_ms=None, sync_mode=None):
     accepted = []
     accepted_ids = set()
     for message in messages:
@@ -518,13 +558,27 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
         accepted_ids.add(mid)
     with db() as con:
         ensure_schema(con)
+        con.execute('BEGIN IMMEDIATE')
         if current_identity(con, alias) != identity:
             raise IdentityMismatch('账号身份发生变化，已停止保存。')
         previous = con.execute('''SELECT id FROM inbox_conversations
                     WHERE alias=? AND identity_hash=? AND external_id=?''',
                     (alias, identity, item['external_id'])).fetchone()
+        # Aliases may refer to the same verified platform account. Carry its
+        # deletion records over even if this alias has never synced before.
+        deletion_rows = con.execute('''SELECT d.message_external_id,MIN(d.deleted_at_ms) AS deleted_at_ms
+                    FROM inbox_message_deletions d JOIN inbox_conversations c ON c.id=d.conversation_id
+                    WHERE c.identity_hash=? AND c.external_id=? GROUP BY d.message_external_id''',
+                    (identity,item['external_id'])).fetchall()
+        deleted_ids = {r['message_external_id'] for r in deletion_rows}
+        peer_cutoff = con.execute('''SELECT MAX(d.deleted_at_ms) FROM inbox_conversation_deletions d
+                    JOIN inbox_conversations c ON c.id=d.conversation_id
+                    WHERE c.identity_hash=? AND c.external_id=?''', (identity,item['external_id'])).fetchone()[0]
         known_ids = set()
         baseline_ms = account_cutoff_ms
+        deletion = None
+        visible_existing_ids = set()
+        existing_ids = set()
         if previous:
             _ensure_alert_anchor(con, previous['id'])
             known_ids = {row['message_external_id'] for row in con.execute(
@@ -546,6 +600,68 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
                     con.execute('UPDATE inbox_alert_cursors SET baseline_ms=? WHERE conversation_id=?',
                                 (corrected, previous['id']))
                 baseline_ms = corrected
+            deletion = con.execute('''SELECT deleted_at_ms,hidden FROM inbox_conversation_deletions
+                                      WHERE conversation_id=?''', (previous['id'],)).fetchone()
+            existing_ids = {r['external_id'] for r in con.execute(
+                'SELECT external_id FROM inbox_messages WHERE conversation_id=?', (previous['id'],))}
+            if deletion:
+                visible_existing_ids = {r['external_id'] for r in con.execute(
+                    'SELECT m.external_id FROM inbox_messages m WHERE m.conversation_id=? AND ' + _VISIBLE_MESSAGE,
+                    (previous['id'],))}
+        inherited_deletion = peer_cutoff is not None and (deletion is None or peer_cutoff > deletion['deleted_at_ms'])
+        if inherited_deletion:
+            deletion = {'deleted_at_ms':peer_cutoff, 'hidden':1}
+        # Keep the full observed window for overlap/order verification, but never
+        # write a deleted message back or backfill history from before deletion.
+        verified_ids = {mid for event in observations or []
+                        if event.get('ok') and not event.get('invalid_ids') and event.get('order_verified') is True
+                        and isinstance(event.get('ids'), set) and isinstance(event.get('ordered_ids'), list)
+                        for mid in event['ordered_ids'] if mid in event['ids']}
+        order = list(dict.fromkeys(mid for event in observations or []
+                                   if event.get('ok') and event.get('order_verified') is True
+                                   and isinstance(event.get('ordered_ids'), list)
+                                   for mid in event['ordered_ids']))
+        boundary = next((index for index, mid in enumerate(order) if mid in known_ids), None)
+        newer_ids = set(order[:boundary]) if boundary is not None else set(order)
+        eligible = []
+        deletion_uncertain = False
+        skipped_backfill = False
+        for message in accepted:
+            mid = message['external_id']
+            if mid in deleted_ids:
+                continue
+            stamp = timestamps.get(mid)
+            valid_stamp = type(stamp) is int and 1_000_000_000_000 <= stamp < 10_000_000_000_000
+            post_delete_evidence = bool(deletion and valid_stamp and stamp > deletion['deleted_at_ms']
+                                        and mid in verified_ids)
+            if (sync_mode == 'quick' and previous and known_ids and mid not in existing_ids and
+                    (boundary is None or mid not in newer_ids) and
+                    not (boundary is None and post_delete_evidence)):
+                skipped_backfill = True
+                continue
+            if deletion:
+                if mid not in visible_existing_ids:
+                    if boundary is not None and mid not in newer_ids:
+                        continue
+                    if known_ids and boundary is None and not complete:
+                        deletion_uncertain = True
+                        if not post_delete_evidence:
+                            continue
+                if not valid_stamp or mid not in verified_ids:
+                    if mid not in known_ids:
+                        deletion_uncertain = True
+                    continue
+                if stamp <= deletion['deleted_at_ms']:
+                    # Coarse platform timestamps or clock skew can make a newly
+                    # ordered/unread message indistinguishable from old history.
+                    if (mid not in existing_ids and mid in newer_ids and
+                            (item.get('unread_before') or stamp >= deletion['deleted_at_ms']-2000)):
+                        deletion_uncertain = True
+                    continue
+            eligible.append(message)
+        eligible_ids = {m['external_id'] for m in eligible}
+        if skipped_backfill:
+            complete = False
         valid_times = [timestamps[m['external_id']] for m in accepted
                        if type(timestamps.get(m['external_id'])) is int
                        and 1_000_000_000_000 <= timestamps[m['external_id']] < 10_000_000_000_000]
@@ -566,6 +682,17 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
                      item['last_time_label'], last_timestamp, item['unread_before'], int(complete), pages))
         row = con.execute('SELECT id FROM inbox_conversations WHERE alias=? AND identity_hash=? AND external_id=?',
                           (alias, identity, item['external_id'])).fetchone()
+        con.executemany('''INSERT OR IGNORE INTO inbox_message_deletions
+                           (conversation_id,message_external_id,deleted_at_ms) VALUES(?,?,?)''',
+                        [(row['id'],r['message_external_id'],r['deleted_at_ms']) for r in deletion_rows])
+        if inherited_deletion:
+            con.execute('''INSERT INTO inbox_conversation_deletions(conversation_id,deleted_at_ms,hidden)
+                           VALUES(?,?,1) ON CONFLICT(conversation_id) DO UPDATE SET
+                           deleted_at_ms=excluded.deleted_at_ms,hidden=1''', (row['id'],peer_cutoff))
+        reopened = bool(deletion and deletion['hidden'] and eligible)
+        if reopened:
+            con.execute('UPDATE inbox_conversation_deletions SET hidden=0 WHERE conversation_id=?', (row['id'],))
+            con.execute("UPDATE inbox_conversations SET status='pending',important=0 WHERE id=?", (row['id'],))
         _ensure_alert_anchor(con, row['id'])
         initial_baseline = baseline_ms
         if initial_baseline is None and observations is None and accepted:
@@ -573,6 +700,10 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
         con.execute('INSERT OR IGNORE INTO inbox_alert_cursors(conversation_id,baseline_ms) VALUES(?,?)',
                     (row['id'], initial_baseline))
         new_ids, review = _recent_incoming(observations, accepted, known_ids, timestamps, baseline_ms)
+        new_ids = [mid for mid in new_ids if mid in eligible_ids]
+        if deletion:
+            new_ids = list(dict.fromkeys(new_ids + [m['external_id'] for m in eligible
+                if m.get('direction') == 'incoming' and m['external_id'] not in existing_ids]))
         if observations:
             unmatched = sorted({mid for event in observations for mid in event.get('render_unmatched', [])})
             if unmatched:
@@ -588,7 +719,11 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
             ids = sorted({mid for event in observations for mid in event.get('ordered_ids',[]) if mid})
             marker = hashlib.sha256(json.dumps(ids,ensure_ascii=False).encode('utf-8')).hexdigest()
             review.append('coverage:' + marker)
-        for index, m in enumerate(accepted):
+        if deletion and deletion['hidden'] and not reopened:
+            new_ids, review = [], []
+        for index, m in enumerate(eligible):
+            if sync_mode == 'quick' and m['external_id'] in existing_ids:
+                continue
             con.execute('''INSERT INTO inbox_messages(conversation_id,external_id,store_id,direction,content_type,
                            body,time_label,timestamp_ms,position) VALUES(?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(conversation_id,external_id) DO UPDATE SET
@@ -622,6 +757,7 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
             con.executemany('''INSERT OR IGNORE INTO inbox_alert_anchor_ids(conversation_id,message_external_id)
                                VALUES(?,?)''', [(row['id'], mid) for mid in accepted_ids])
         safe_window = (_observations_complete(observations, accepted_ids) and not unresolved_review and
+                       not deletion_uncertain and
                        _coverage_complete(observations,known_ids,complete))
         newest_id = next((mid for event in observations or [] for mid in event.get('ordered_ids', []) if mid), None)
         verified_timestamp = timestamps.get(newest_id) if newest_id in accepted_ids else None
@@ -633,7 +769,8 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
                        WHEN ? THEN ? ELSE MAX(baseline_ms,?) END WHERE conversation_id=?''',
                         (verified_timestamp, not known_ids, verified_timestamp, verified_timestamp, row['id']))
             con.executemany('''INSERT OR IGNORE INTO inbox_alert_anchor_ids(conversation_id,message_external_id)
-                               VALUES(?,?)''', [(row['id'], mid) for mid in accepted_ids])
+                               VALUES(?,?)''', [(row['id'], mid) for mid in accepted_ids
+                                                if mid in eligible_ids or mid in existing_ids])
         signature = _list_signature(item)
         if safe_window and signature and _metadata_matches_latest(item,observations,accepted,timestamps):
             con.execute('''INSERT INTO inbox_quick_checkpoints(conversation_id,signature,verified_at_ms) VALUES(?,?,?)
@@ -642,15 +779,17 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
         else:
             con.execute('DELETE FROM inbox_quick_checkpoints WHERE conversation_id=?',(row['id'],))
         for mid, (mime, data) in (media or {}).items():
-            if mid in accepted_ids:
+            if mid in eligible_ids and (sync_mode != 'quick' or mid not in existing_ids):
                 con.execute('''INSERT OR IGNORE INTO inbox_media(conversation_id,message_external_id,mime_type,data)
                                VALUES(?,?,?,?)''', (row['id'], mid, mime, data))
+        if deletion or deleted_ids:
+            _refresh_visible_preview(con, row['id'])
         unverified = con.execute('''SELECT COUNT(*) FROM inbox_messages m LEFT JOIN inbox_message_proofs p
                     ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
                     WHERE m.conversation_id=? AND p.message_external_id IS NULL''', (row['id'],)).fetchone()[0]
         if unverified:
             con.execute('UPDATE inbox_conversations SET history_complete=0 WHERE id=?', (row['id'],))
-        return bool(complete and not unverified)
+        return bool(complete and not unverified and not deletion_uncertain)
 
 
 def _read_history(page, expected_id):
@@ -900,7 +1039,7 @@ def sync_account(alias, *, max_conversations=None, max_pages=HISTORY_PAGES_PER_R
                         raise ValueError('历史消息未能加载。')
                     media = _fetch_media(page, alias, identity, item, messages)
                     complete = _save_conversation(alias, identity, item, messages, timestamps, complete, pages, media,
-                                                  observations=events, account_cutoff_ms=account_cutoff)
+                                                  observations=events, account_cutoff_ms=account_cutoff, sync_mode=mode)
                     if (not _observations_complete(events, {m.get('external_id') for m in messages}) or
                             not _coverage_complete(events,existing_ids,complete) or
                             _has_unresolved_review(alias,identity,item['external_id'])):
@@ -915,7 +1054,8 @@ def sync_account(alias, *, max_conversations=None, max_pages=HISTORY_PAGES_PER_R
                     # List metadata has already been read under the verified account.
                     # Keep the conversation visible even if its history fails to load.
                     verify_web_identity(page, identity)
-                    _save_conversation(alias, identity, item, [], {}, False, 0, account_cutoff_ms=account_cutoff)
+                    _save_conversation(alias, identity, item, [], {}, False, 0, account_cutoff_ms=account_cutoff,
+                                       sync_mode=mode)
                     errors += 1
                 finally:
                     page.remove_listener('response', observer)
@@ -976,7 +1116,7 @@ def inbox_accounts():
                 s.state, s.detail, s.synced_at,
                 m.mode AS last_sync_mode,m.elapsed_ms,m.wait_ms,m.opened,m.reused,
                 (SELECT COUNT(*) FROM inbox_conversations c WHERE c.alias=a.alias
-                 AND c.identity_hash=i.identity_hash) AS conversations
+                 AND c.identity_hash=i.identity_hash AND ''' + _VISIBLE_CONVERSATION + ''') AS conversations
             FROM accounts a LEFT JOIN account_profiles p ON p.alias=a.alias
             LEFT JOIN account_identities i ON i.alias=a.alias
             LEFT JOIN inbox_accounts s ON s.alias=a.alias
@@ -1000,21 +1140,20 @@ def conversation_id_for_key(key):
     with db() as con:
         ensure_schema(con)
         rows = con.execute('''SELECT c.id,c.identity_hash,c.external_id FROM inbox_conversations c
-                JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash''').fetchall()
+                JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash WHERE '''
+                + _VISIBLE_CONVERSATION).fetchall()
         matches = [row['id'] for row in rows if _conversation_key(row['identity_hash'],row['external_id']) == key]
         if len(matches) != 1:
             raise ValueError('会话不存在或账号身份已更换。')
         return matches[0]
 
 
-def list_conversations(alias='', query='', status='all', limit=100, offset=0):
+def _conversation_filter(alias, query, status):
     if not isinstance(alias, str) or not isinstance(query, str) or len(query) > 200:
         raise ValueError('筛选条件无效。')
     if status not in ('all', 'pending', 'processed', 'important', 'new'):
         raise ValueError('处理状态无效。')
-    if not isinstance(limit, int) or not 1 <= limit <= 200 or not isinstance(offset, int) or offset < 0:
-        raise ValueError('分页参数无效。')
-    where = ['i.identity_hash=c.identity_hash']
+    where = ['i.identity_hash=c.identity_hash', _VISIBLE_CONVERSATION]
     params = []
     if alias:
         where.append('c.alias=?')
@@ -1031,24 +1170,38 @@ def list_conversations(alias='', query='', status='all', limit=100, offset=0):
         where.append('''(c.display_name LIKE ? ESCAPE '\\' OR c.last_preview LIKE ? ESCAPE '\\'
                      OR EXISTS (SELECT 1 FROM inbox_messages m JOIN inbox_message_proofs p
                          ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
-                         WHERE m.conversation_id=c.id AND m.body LIKE ? ESCAPE '\\'))''')
+                          WHERE m.conversation_id=c.id AND ''' + _VISIBLE_MESSAGE + ''' AND m.body LIKE ? ESCAPE '\\'))''')
         params.extend([term, term, term])
-    condition = ' AND '.join(where)
+    return ' AND '.join(where), params
+
+
+def list_conversations(alias='', query='', status='all', limit=100, offset=0):
+    condition, params = _conversation_filter(alias, query, status)
+    if not isinstance(limit, int) or not 1 <= limit <= 200 or not isinstance(offset, int) or offset < 0:
+        raise ValueError('分页参数无效。')
     base = ''' FROM inbox_conversations c JOIN account_identities i ON i.alias=c.alias
-               JOIN accounts a ON a.alias=c.alias'''
+               JOIN accounts a ON a.alias=c.alias LEFT JOIN account_profiles ap ON ap.alias=c.alias'''
     with db() as con:
         ensure_schema(con)
         total = con.execute('SELECT COUNT(*)' + base + ' WHERE ' + condition, params).fetchone()[0]
-        rows = con.execute('''SELECT c.id,c.alias,c.identity_hash,c.external_id,a.label AS account_label,c.display_name,c.location,
+        rows = con.execute('''SELECT c.id,c.alias,c.identity_hash,c.external_id,a.label AS account_label,
+                     ap.nickname AS account_nickname,1 AS identity_verified,c.display_name,c.location,
                      c.last_preview,c.last_time_label,c.last_timestamp_ms,c.status,c.important,
-                     c.history_complete,c.history_pages,c.synced_at,
+                     CASE WHEN EXISTS(SELECT 1 FROM inbox_conversation_deletions dc WHERE dc.conversation_id=c.id)
+                              OR EXISTS(SELECT 1 FROM inbox_message_deletions dm WHERE dm.conversation_id=c.id)
+                          THEN 0 ELSE c.history_complete END AS history_complete,
+                     EXISTS(SELECT 1 FROM inbox_conversation_deletions dc WHERE dc.conversation_id=c.id)
+                       OR EXISTS(SELECT 1 FROM inbox_message_deletions dm WHERE dm.conversation_id=c.id) AS history_locally_filtered,
+                     c.history_pages,c.synced_at,
                      (SELECT COUNT(*) FROM inbox_alerts n WHERE n.conversation_id=c.id
                         AND n.kind='new' AND n.acknowledged=0) AS new_count,
                      EXISTS(SELECT 1 FROM inbox_alerts n WHERE n.conversation_id=c.id
                         AND n.kind='review' AND n.acknowledged=0) AS review_needed,
+                      COALESCE((SELECT MAX(n.id) FROM inbox_alerts n WHERE n.conversation_id=c.id),0) AS alerts_version,
+                      COALESCE((SELECT MAX(m.rowid) FROM inbox_messages m WHERE m.conversation_id=c.id),0) AS messages_version,
                      (SELECT COUNT(*) FROM inbox_messages m JOIN inbox_message_proofs p
                          ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
-                         WHERE m.conversation_id=c.id) AS message_count'''
+                          WHERE m.conversation_id=c.id AND ''' + _VISIBLE_MESSAGE + ''') AS message_count'''
                      + base + ' WHERE ' + condition + ''' ORDER BY COALESCE(c.last_timestamp_ms,0) DESC,
                      c.synced_at DESC,c.id DESC LIMIT ? OFFSET ?''', (*params, limit, offset))
         conversations = []
@@ -1056,7 +1209,44 @@ def list_conversations(alias='', query='', status='all', limit=100, offset=0):
             entry = dict(row)
             entry['conversation_key'] = _conversation_key(entry.pop('identity_hash'),entry.pop('external_id'))
             conversations.append(entry)
-        return {'conversations': conversations, 'total': total, 'limit': limit, 'offset': offset}
+        return {'conversations': conversations, 'total': total, 'limit': limit, 'offset': offset,
+                'bulk_delete_available': True}
+
+
+def conversation_selection(alias='', query='', status='all'):
+    condition, params = _conversation_filter(alias, query, status)
+    with db() as con:
+        ensure_schema(con)
+        rows = con.execute('''SELECT c.id,
+                     COALESCE((SELECT MAX(m.rowid) FROM inbox_messages m WHERE m.conversation_id=c.id),0) AS messages_version,
+                     COALESCE((SELECT MAX(n.id) FROM inbox_alerts n WHERE n.conversation_id=c.id),0) AS alerts_version
+                     FROM inbox_conversations c JOIN account_identities i ON i.alias=c.alias
+                     WHERE ''' + condition + ' ORDER BY c.id LIMIT ?', (*params, MAX_BATCH_DELETE + 1)).fetchall()
+        if len(rows) > MAX_BATCH_DELETE:
+            raise ValueError('匹配会话超过 10000 个，请先缩小筛选范围。')
+        return {'conversations':[dict(row) for row in rows]}
+
+
+def message_selection(conversation_id):
+    if type(conversation_id) is not int or conversation_id <= 0:
+        raise ValueError('会话不存在。')
+    with db() as con:
+        ensure_schema(con)
+        con.execute('BEGIN')
+        row = con.execute('''SELECT c.identity_hash,c.external_id FROM inbox_conversations c
+                    JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash
+                    WHERE c.id=? AND ''' + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
+        if not row:
+            raise ValueError('会话不存在或账号身份已更换。')
+        rows = con.execute('''SELECT m.external_id FROM inbox_messages m JOIN inbox_message_proofs p
+                    ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
+                    WHERE m.conversation_id=? AND ''' + _VISIBLE_MESSAGE + ' LIMIT ?',
+                    (conversation_id,MAX_BATCH_DELETE + 1)).fetchall()
+        if len(rows) > MAX_BATCH_DELETE:
+            raise ValueError('本机会话超过 10000 条消息，请分批选择。')
+        key = _conversation_key(row['identity_hash'],row['external_id'])
+        return {'messages':[{'message_id':_message_key(key,r['external_id']),
+                             'platform_message_id':r['external_id']} for r in rows]}
 
 
 def conversation(conversation_id, limit=200, offset=0):
@@ -1066,29 +1256,37 @@ def conversation(conversation_id, limit=200, offset=0):
         raise ValueError('分页参数无效。')
     with db() as con:
         ensure_schema(con)
-        row = con.execute('''SELECT c.id,c.alias,c.identity_hash,c.external_id,a.label AS account_label,c.display_name,c.location,
+        row = con.execute('''SELECT c.id,c.alias,c.identity_hash,c.external_id,a.label AS account_label,
+                     ap.nickname AS account_nickname,1 AS identity_verified,c.display_name,c.location,
                      c.last_preview,c.last_time_label,c.last_timestamp_ms,c.status,c.important,
-                     c.history_complete,c.history_pages,c.synced_at,
+                     CASE WHEN EXISTS(SELECT 1 FROM inbox_conversation_deletions dc WHERE dc.conversation_id=c.id)
+                              OR EXISTS(SELECT 1 FROM inbox_message_deletions dm WHERE dm.conversation_id=c.id)
+                          THEN 0 ELSE c.history_complete END AS history_complete,
+                     EXISTS(SELECT 1 FROM inbox_conversation_deletions dc WHERE dc.conversation_id=c.id)
+                       OR EXISTS(SELECT 1 FROM inbox_message_deletions dm WHERE dm.conversation_id=c.id) AS history_locally_filtered,
+                     c.history_pages,c.synced_at,
                      (SELECT COUNT(*) FROM inbox_alerts n WHERE n.conversation_id=c.id
                         AND n.kind='new' AND n.acknowledged=0) AS new_count,
                      EXISTS(SELECT 1 FROM inbox_alerts n WHERE n.conversation_id=c.id
                         AND n.kind='review' AND n.acknowledged=0) AS review_needed,
-                     COALESCE((SELECT MAX(n.id) FROM inbox_alerts n WHERE n.conversation_id=c.id),0) AS alerts_version
+                     COALESCE((SELECT MAX(n.id) FROM inbox_alerts n WHERE n.conversation_id=c.id),0) AS alerts_version,
+                     COALESCE((SELECT MAX(m.rowid) FROM inbox_messages m WHERE m.conversation_id=c.id),0) AS messages_version
                      FROM inbox_conversations c JOIN account_identities i
                        ON i.alias=c.alias AND i.identity_hash=c.identity_hash
-                     JOIN accounts a ON a.alias=c.alias WHERE c.id=?''', (conversation_id,)).fetchone()
+                     JOIN accounts a ON a.alias=c.alias LEFT JOIN account_profiles ap ON ap.alias=c.alias
+                     WHERE c.id=? AND ''' + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
         if not row:
             raise ValueError('会话不存在或账号身份已更换。')
         total = con.execute('''SELECT COUNT(*) FROM inbox_messages m JOIN inbox_message_proofs p
                     ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
-                    WHERE m.conversation_id=?''', (conversation_id,)).fetchone()[0]
+                     WHERE m.conversation_id=? AND ''' + _VISIBLE_MESSAGE, (conversation_id,)).fetchone()[0]
         messages = con.execute('''SELECT m.external_id,m.direction,m.content_type,m.body,m.time_label,m.timestamp_ms,
                                          media.id AS media_id
                                   FROM inbox_messages m JOIN inbox_message_proofs p
                                     ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
                                   LEFT JOIN inbox_media media
                                     ON media.conversation_id=m.conversation_id AND media.message_external_id=m.external_id
-                                  WHERE m.conversation_id=?
+                                   WHERE m.conversation_id=? AND ''' + _VISIBLE_MESSAGE + '''
                                   ORDER BY CASE WHEN m.timestamp_ms IS NULL THEN 1 ELSE 0 END,
                                            m.timestamp_ms,m.position,m.external_id LIMIT ? OFFSET ?''',
                                (conversation_id, limit, offset))
@@ -1113,16 +1311,139 @@ def conversation(conversation_id, limit=200, offset=0):
                 'total': total, 'limit': limit, 'offset': offset}
 
 
+def delete_messages(conversation_id, messages):
+    if (type(conversation_id) is not int or conversation_id <= 0 or
+            not isinstance(messages,list) or not 1 <= len(messages) <= MAX_BATCH_DELETE):
+        raise ValueError('请选择 1 至 10000 条消息。')
+    ids = set()
+    for message in messages:
+        if (not isinstance(message,dict) or set(message) != {'message_id','platform_message_id'} or
+                not isinstance(message['message_id'],str) or
+                not re.fullmatch(r'xhm1_[0-9a-f]{64}',message['message_id']) or
+                not isinstance(message['platform_message_id'],str) or
+                not 1 <= len(message['platform_message_id']) <= 256 or message['platform_message_id'] in ids):
+            raise ValueError('消息标识无效或重复，请刷新后重试。')
+        ids.add(message['platform_message_id'])
+    with db() as con:
+        ensure_schema(con)
+        con.execute('BEGIN IMMEDIATE')
+        row = con.execute('''SELECT c.identity_hash,c.external_id FROM inbox_conversations c
+            JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash
+            WHERE c.id=? AND ''' + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
+        if not row:
+            raise ValueError('会话不存在或账号身份已更换。')
+        stable = _conversation_key(row['identity_hash'],row['external_id'])
+        for message in messages:
+            mid = message['platform_message_id']
+            if _message_key(stable,mid) != message['message_id']:
+                raise ValueError('消息与当前会话不匹配，请刷新后重试。')
+            exists = con.execute('''SELECT 1 FROM inbox_messages m JOIN inbox_message_proofs p
+                ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
+                WHERE m.conversation_id=? AND m.external_id=? AND ''' + _VISIBLE_MESSAGE,
+                (conversation_id,mid)).fetchone()
+            if not exists:
+                raise ValueError('消息不存在或已删除，请刷新后重试。')
+        peers = [r['id'] for r in con.execute('''SELECT id FROM inbox_conversations
+                    WHERE identity_hash=? AND external_id=?''', (row['identity_hash'],row['external_id']))]
+        deleted_at = int(time.time()*1000)
+        for peer in peers:
+            con.executemany('''INSERT OR IGNORE INTO inbox_message_deletions(conversation_id,message_external_id,deleted_at_ms)
+                               VALUES(?,?,?)''', [(peer,mid,deleted_at) for mid in ids])
+            con.executemany('''UPDATE inbox_alerts SET acknowledged=1
+                               WHERE conversation_id=? AND message_external_id=?''', [(peer,mid) for mid in ids])
+            con.execute('DELETE FROM inbox_quick_checkpoints WHERE conversation_id=?', (peer,))
+            _refresh_visible_preview(con,peer)
+    return {'deleted':len(messages)}
+
+
+def delete_message(conversation_id, message_id, platform_message_id):
+    delete_messages(conversation_id,[{'message_id':message_id,'platform_message_id':platform_message_id}])
+    return {'deleted':True}
+
+
+def _validate_conversation_deletion(con, selection):
+    conversation_id = selection['id']
+    row = con.execute('''SELECT c.id,c.identity_hash,c.external_id FROM inbox_conversations c JOIN account_identities i
+        ON i.alias=c.alias AND i.identity_hash=c.identity_hash WHERE c.id=? AND '''
+        + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
+    if not row:
+        raise ValueError('会话不存在或账号身份已更换，请刷新后重试。')
+    current_messages = con.execute('SELECT COALESCE(MAX(rowid),0) FROM inbox_messages WHERE conversation_id=?',
+                                   (conversation_id,)).fetchone()[0]
+    current_alerts = con.execute('SELECT COALESCE(MAX(id),0) FROM inbox_alerts WHERE conversation_id=?',
+                                 (conversation_id,)).fetchone()[0]
+    if (current_messages,current_alerts) != (selection['messages_version'],selection['alerts_version']):
+        raise ValueError('会话有新变化，请刷新并核对后再删除。')
+    unseen = con.execute('''SELECT 1 FROM inbox_messages m JOIN inbox_conversations c ON c.id=m.conversation_id
+        WHERE c.identity_hash=? AND c.external_id=? AND c.id<>?
+          AND NOT EXISTS (SELECT 1 FROM inbox_messages own WHERE own.conversation_id=?
+                          AND own.external_id=m.external_id) LIMIT 1''',
+        (row['identity_hash'],row['external_id'],conversation_id,conversation_id)).fetchone()
+    if unseen:
+        raise ValueError('同一账号的另一别名有未核对的消息，请先同步并查看后再删除。')
+    return row
+
+
+def delete_conversations(selections):
+    if not isinstance(selections,list) or not 1 <= len(selections) <= MAX_BATCH_DELETE:
+        raise ValueError('请选择 1 至 10000 个会话。')
+    selected_ids = set()
+    for selection in selections:
+        if (not isinstance(selection,dict) or set(selection) != {'id','messages_version','alerts_version'} or
+                type(selection['id']) is not int or selection['id'] <= 0 or
+                type(selection['messages_version']) is not int or selection['messages_version'] < 0 or
+                type(selection['alerts_version']) is not int or selection['alerts_version'] < 0 or
+                selection['id'] in selected_ids):
+            raise ValueError('会话版本无效或重复，请刷新后重试。')
+        selected_ids.add(selection['id'])
+    with db() as con:
+        ensure_schema(con)
+        con.execute('BEGIN IMMEDIATE')
+        rows = [_validate_conversation_deletion(con,selection) for selection in selections]
+        seen_threads = set()
+        for row in rows:
+            thread = (row['identity_hash'],row['external_id'])
+            if thread in seen_threads:
+                continue
+            seen_threads.add(thread)
+            peers = [r['id'] for r in con.execute('''SELECT id FROM inbox_conversations
+                        WHERE identity_hash=? AND external_id=?''',thread)]
+            last_verified = con.execute('''SELECT MAX(m.timestamp_ms) FROM inbox_messages m JOIN inbox_message_proofs p
+                ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
+                JOIN inbox_conversations c ON c.id=m.conversation_id
+                WHERE c.identity_hash=? AND c.external_id=? AND typeof(m.timestamp_ms)='integer'
+                  AND m.timestamp_ms>=1000000000000 AND m.timestamp_ms<10000000000000''',thread).fetchone()[0]
+            cutoff = max(int(time.time()*1000),last_verified or 0)
+            for peer in peers:
+                con.execute('''INSERT INTO inbox_conversation_deletions(conversation_id,deleted_at_ms,hidden)
+                    VALUES(?,?,1) ON CONFLICT(conversation_id) DO UPDATE SET
+                    deleted_at_ms=MAX(inbox_conversation_deletions.deleted_at_ms,excluded.deleted_at_ms),hidden=1''',
+                    (peer,cutoff))
+                con.execute('''INSERT OR IGNORE INTO inbox_message_deletions(conversation_id,message_external_id,deleted_at_ms)
+                    SELECT conversation_id,external_id,? FROM inbox_messages WHERE conversation_id=?''', (cutoff,peer))
+                con.execute('UPDATE inbox_alerts SET acknowledged=1 WHERE conversation_id=?', (peer,))
+                con.execute("UPDATE inbox_conversations SET status='pending',important=0,unread_before=0 WHERE id=?", (peer,))
+                con.execute('DELETE FROM inbox_quick_checkpoints WHERE conversation_id=?', (peer,))
+                _refresh_visible_preview(con,peer)
+    return {'deleted':len(selections)}
+
+
+def delete_conversation(conversation_id, *, messages_version, alerts_version):
+    delete_conversations([{'id':conversation_id,'messages_version':messages_version,'alerts_version':alerts_version}])
+    return {'deleted':True}
+
+
 def media_file(media_id):
     if not isinstance(media_id, int) or media_id <= 0:
         raise ValueError('图片不存在。')
     with db() as con:
         ensure_schema(con)
-        row = con.execute('''SELECT m.mime_type,m.data FROM inbox_media m
-                JOIN inbox_conversations c ON c.id=m.conversation_id
+        row = con.execute('''SELECT media.mime_type,media.data FROM inbox_media media
+                JOIN inbox_messages m ON m.conversation_id=media.conversation_id AND m.external_id=media.message_external_id
+                JOIN inbox_conversations c ON c.id=media.conversation_id
                 JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash
-                JOIN inbox_message_proofs p ON p.conversation_id=m.conversation_id AND p.message_external_id=m.message_external_id
-                WHERE m.id=?''', (media_id,)).fetchone()
+                JOIN inbox_message_proofs p ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
+                WHERE media.id=? AND ''' + _VISIBLE_CONVERSATION + ' AND ' + _VISIBLE_MESSAGE, (media_id,)).fetchone()
         if not row:
             raise ValueError('图片不存在或账号身份已更换。')
         return row['mime_type'], row['data']
@@ -1141,7 +1462,8 @@ def update_conversation(conversation_id, *, status=None, important=None, alerts_
         ensure_schema(con)
         con.execute('BEGIN IMMEDIATE')
         visible = con.execute('''SELECT c.id FROM inbox_conversations c JOIN account_identities i
-             ON i.alias=c.alias AND i.identity_hash=c.identity_hash WHERE c.id=?''', (conversation_id,)).fetchone()
+             ON i.alias=c.alias AND i.identity_hash=c.identity_hash WHERE c.id=? AND '''
+             + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
         if not visible:
             raise ValueError('会话不存在或账号身份已更换。')
         if status is not None:
@@ -1164,7 +1486,8 @@ def acknowledge_alerts(conversation_id, alert_ids):
     with db() as con:
         ensure_schema(con)
         visible = con.execute('''SELECT c.id FROM inbox_conversations c JOIN account_identities i
-             ON i.alias=c.alias AND i.identity_hash=c.identity_hash WHERE c.id=?''', (conversation_id,)).fetchone()
+             ON i.alias=c.alias AND i.identity_hash=c.identity_hash WHERE c.id=? AND '''
+             + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
         if not visible:
             raise ValueError('会话不存在或账号身份已更换。')
         count = 0
@@ -1185,7 +1508,7 @@ def inbox_summary():
             MAX(CASE WHEN n.kind='review' THEN n.id END) AS latest_review_id
             FROM inbox_alerts n JOIN inbox_conversations c ON c.id=n.conversation_id
             JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash
-            WHERE n.acknowledged=0''').fetchone()
+            WHERE n.acknowledged=0 AND ''' + _VISIBLE_CONVERSATION).fetchone()
         return {'new_count': row['new_count'] or 0, 'review_count': row['review_count'] or 0,
                 'latest_new_id': row['latest_new_id'] or 0, 'latest_review_id': row['latest_review_id'] or 0}
 
@@ -1197,7 +1520,7 @@ def open_conversation(conversation_id, *, until_closed=True, cancel_requested=No
         ensure_schema(con)
         row = con.execute('''SELECT c.alias,c.identity_hash,c.external_id FROM inbox_conversations c
                 JOIN account_identities i ON i.alias=c.alias AND i.identity_hash=c.identity_hash
-                WHERE c.id=?''', (conversation_id,)).fetchone()
+                WHERE c.id=? AND ''' + _VISIBLE_CONVERSATION, (conversation_id,)).fetchone()
         if not row:
             raise ValueError('会话不存在或账号身份已更换。')
         saved = dict(row)
