@@ -500,6 +500,112 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(inbox._existing_history('xhs01','1'*64,self.item['external_id'])[2],
                          {'message','missing','latest'})
 
+    def test_list_time_ahead_cannot_hide_a_later_incoming_message(self):
+        one = inbox.list_conversations(alias='xhs01')['conversations'][0]
+        inbox.update_conversation(one['id'], status='processed')
+        stamp = 1794640000000
+        item = self.item | {'_last_timestamp': stamp + 50000}
+        old = {'ok':True, 'ids':{'message'}, 'ordered_ids':['message'],
+               'order_verified':True, 'render_verified':True, 'count':1, 'limit':30}
+        inbox._save_conversation('xhs01','1'*64,item,[self.message],{'message':stamp},
+                                 True,1,observations=[old])
+        with db() as con:
+            baseline = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',
+                                   (one['id'],)).fetchone()[0]
+        self.assertEqual(baseline, stamp)
+        self.assertEqual(inbox.conversation(one['id'])['conversation']['last_timestamp_ms'], stamp + 50000)
+        incoming = self.message | {'external_id':'incoming'}
+        window = old | {'ids':{'incoming','message'}, 'ordered_ids':['incoming','message'], 'count':2}
+        for _ in range(2):
+            inbox._save_conversation('xhs01','1'*64,item,[self.message,incoming],
+                                     {'message':stamp,'incoming':stamp+10000},True,1,observations=[window])
+        current = inbox.conversation(one['id'])['conversation']
+        self.assertEqual(current['status'], 'pending')
+        self.assertEqual(current['new_count'], 1)
+        with db() as con:
+            baseline = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',
+                                   (one['id'],)).fetchone()[0]
+        self.assertEqual(baseline, stamp + 10000)
+
+    def test_existing_ahead_cursor_is_bounded_by_confirmed_anchor(self):
+        one = inbox.list_conversations(alias='xhs01')['conversations'][0]
+        inbox.update_conversation(one['id'], status='processed')
+        stamp = 1794640000000
+        with db() as con:
+            con.execute('UPDATE inbox_alert_cursors SET baseline_ms=? WHERE conversation_id=?',
+                        (stamp+50000,one['id']))
+        incoming = self.message | {'external_id':'incoming'}
+        window = {'ok':True, 'ids':{'incoming','message'}, 'ordered_ids':['incoming','message'],
+                  'order_verified':True, 'render_verified':True, 'count':2, 'limit':30}
+        inbox._save_conversation('xhs01','1'*64,self.item,[self.message,incoming],
+                                 {'message':stamp,'incoming':stamp+10000},True,1,observations=[window])
+        current = inbox.conversation(one['id'])['conversation']
+        self.assertEqual(current['status'], 'pending')
+        self.assertEqual(current['new_count'], 1)
+        with db() as con:
+            baseline = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',
+                                   (one['id'],)).fetchone()[0]
+        self.assertEqual(baseline, stamp+10000)
+
+    def test_missing_cursor_does_not_inherit_unverified_list_time(self):
+        one = inbox.list_conversations(alias='xhs01')['conversations'][0]
+        inbox.update_conversation(one['id'], status='processed')
+        stamp = 1794640000000
+        with db() as con:
+            con.execute('DELETE FROM inbox_alert_cursors WHERE conversation_id=?', (one['id'],))
+            con.execute('UPDATE inbox_conversations SET last_timestamp_ms=? WHERE id=?', (stamp+50000,one['id']))
+        incoming = self.message | {'external_id':'incoming'}
+        window = {'ok':True, 'ids':{'incoming','message'}, 'ordered_ids':['incoming','message'],
+                  'order_verified':True, 'render_verified':True, 'count':2, 'limit':30}
+        inbox._save_conversation('xhs01','1'*64,self.item,[self.message,incoming],
+                                 {'message':stamp,'incoming':stamp+10000},True,1,observations=[window])
+        self.assertEqual(inbox.conversation(one['id'])['conversation']['new_count'], 1)
+
+    def test_unverified_message_time_cannot_advance_baseline(self):
+        one = inbox.list_conversations(alias='xhs01')['conversations'][0]
+        stamp = 1794640000000
+        extra = self.message | {'external_id':'extra'}
+        window = {'ok':True, 'ids':{'message'}, 'ordered_ids':['message'],
+                  'order_verified':True, 'render_verified':True, 'count':1, 'limit':30}
+        inbox._save_conversation('xhs01','1'*64,self.item,[self.message,extra],
+                                 {'message':stamp,'extra':stamp+50000},True,1,observations=[window])
+        with db() as con:
+            baseline = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',
+                                   (one['id'],)).fetchone()[0]
+        self.assertEqual(baseline, stamp)
+        self.assertTrue(inbox.conversation(one['id'])['conversation']['review_needed'])
+        self.assertNotIn('extra',inbox._existing_history('xhs01','1'*64,self.item['external_id'])[2])
+
+    def test_missing_newest_time_does_not_advance_or_cache(self):
+        one = inbox.list_conversations(alias='xhs01')['conversations'][0]
+        stamp = 1794640000000
+        newer = self.message | {'external_id':'newer', 'direction':'outgoing', 'store_id':'11'}
+        item = self.item | {'_last_timestamp':stamp+50000,'_max_store_id':11,
+                            '_list_update_time':stamp+51000,'unread_before':0}
+        window = {'ok':True,'ids':{'newer','message'},'ordered_ids':['newer','message'],
+                  'order_verified':True,'render_verified':True,'count':2,'limit':30}
+        inbox._save_conversation('xhs01','1'*64,item,[self.message,newer],{'message':stamp},
+                                 True,1,observations=[window])
+        with db() as con:
+            baseline = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',
+                                   (one['id'],)).fetchone()[0]
+        self.assertEqual(baseline, stamp)
+        self.assertEqual(inbox._existing_history('xhs01','1'*64,self.item['external_id'])[2], {'message'})
+        self.assertIsNone(inbox._reuse_unchanged_conversation('xhs01','1'*64,item))
+
+    def test_new_conversation_cutoff_is_not_stored_ahead_of_verified_message(self):
+        stamp = 1794640000000
+        item = self.item | {'external_id':'other'}
+        window = {'ok':True,'ids':{'message'},'ordered_ids':['message'],
+                  'order_verified':True,'render_verified':True,'count':1,'limit':30}
+        inbox._save_conversation('xhs01','1'*64,item,[self.message],{'message':stamp},
+                                 True,1,observations=[window],account_cutoff_ms=stamp+50000)
+        with db() as con:
+            cursors = [row[0] for row in con.execute('''SELECT c.baseline_ms FROM inbox_alert_cursors c
+                       JOIN inbox_conversations v ON v.id=c.conversation_id
+                       WHERE v.alias=? AND v.external_id=?''',('xhs01','other'))]
+        self.assertEqual(cursors, [stamp])
+
     def test_incomplete_older_rows_do_not_advance_timestamp_cursor(self):
         one = inbox.list_conversations(alias='xhs01')['conversations'][0]
         item = self.item | {'_last_timestamp':1794640050000}
@@ -540,7 +646,7 @@ class InboxTests(unittest.TestCase):
                                  observations=[complete])
         with db() as con:
             baseline = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',(one['id'],)).fetchone()[0]
-        self.assertEqual(baseline,1794640050000)
+        self.assertEqual(baseline,1794640000000)
 
     def test_no_anchor_overlap_cannot_advance_until_history_exhausted_and_reviewed(self):
         one = inbox.list_conversations(alias='xhs01')['conversations'][0]
@@ -586,6 +692,19 @@ class InboxTests(unittest.TestCase):
         item = self.item | {'_last_timestamp':1794640000000,'_max_store_id':10,
                             '_list_update_time':1794640001000,'unread_before':0}
         legacy = [item['_last_timestamp'],str(item['_max_store_id']),str(item['_list_update_time']),item['last_preview']]
+        old_signature = hashlib.sha256(json.dumps(legacy,ensure_ascii=False,separators=(',',':')).encode('utf-8')).hexdigest()
+        one = inbox.list_conversations(alias='xhs01')['conversations'][0]
+        with db() as con:
+            con.execute('''INSERT INTO inbox_quick_checkpoints(conversation_id,signature,verified_at_ms)
+                           VALUES(?,?,?)''',(one['id'],old_signature,1794640100000))
+        with patch('inbox.time.time',return_value=1794640100):
+            self.assertIsNone(inbox._reuse_unchanged_conversation('xhs01','1'*64,item))
+
+    def test_quick_cache_from_before_cursor_fix_is_rechecked(self):
+        item = self.item | {'_last_timestamp':1794640000000,'_max_store_id':10,
+                            '_list_update_time':1794640001000,'unread_before':0}
+        legacy = ['render-verified-v2',item['_last_timestamp'],str(item['_max_store_id']),
+                  str(item['_list_update_time']),item['last_preview']]
         old_signature = hashlib.sha256(json.dumps(legacy,ensure_ascii=False,separators=(',',':')).encode('utf-8')).hexdigest()
         one = inbox.list_conversations(alias='xhs01')['conversations'][0]
         with db() as con:

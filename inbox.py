@@ -428,6 +428,7 @@ def _recent_incoming(observations, messages, known_ids, timestamps, baseline_ms)
 def _observations_complete(observations, accepted_ids):
     if not observations:
         return False
+    observed_ids = set()
     for event in observations:
         ordered = event.get('ordered_ids')
         ids = event.get('ids')
@@ -436,7 +437,8 @@ def _observations_complete(observations, accepted_ids):
                 not isinstance(ordered, list) or not isinstance(ids, set) or
                 set(ordered) != ids or not ids.issubset(accepted_ids)):
             return False
-    return True
+        observed_ids.update(ids)
+    return observed_ids == accepted_ids
 
 
 def _coverage_complete(observations, known_ids, history_complete):
@@ -450,8 +452,8 @@ def _list_signature(item):
             type(store) is not int or store <= 0 or type(updated) is not int or updated <= 0 or
             not isinstance(item.get('last_preview'), str)):
         return None
-    # Pre-fix cache entries did not attest that every rendered row was verified.
-    value = ['render-verified-v2', stamp, str(store), str(updated), item['last_preview']]
+    # Earlier entries may have advanced the cursor using list metadata.
+    value = ['confirmed-message-time-v3', stamp, str(store), str(updated), item['last_preview']]
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
@@ -518,7 +520,7 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
         ensure_schema(con)
         if current_identity(con, alias) != identity:
             raise IdentityMismatch('账号身份发生变化，已停止保存。')
-        previous = con.execute('''SELECT id,last_timestamp_ms FROM inbox_conversations
+        previous = con.execute('''SELECT id FROM inbox_conversations
                     WHERE alias=? AND identity_hash=? AND external_id=?''',
                     (alias, identity, item['external_id'])).fetchone()
         known_ids = set()
@@ -529,8 +531,24 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
                 'SELECT message_external_id FROM inbox_alert_anchor_ids WHERE conversation_id=?', (previous['id'],))}
             cursor = con.execute('SELECT baseline_ms FROM inbox_alert_cursors WHERE conversation_id=?',
                                  (previous['id'],)).fetchone()
-            baseline_ms = cursor['baseline_ms'] if cursor else previous['last_timestamp_ms']
-        valid_times = [timestamps[m['external_id']] for m in accepted if m['external_id'] in timestamps]
+            anchor_time = con.execute('''SELECT MAX(m.timestamp_ms) FROM inbox_alert_anchor_ids a
+                JOIN inbox_messages m ON m.conversation_id=a.conversation_id AND m.external_id=a.message_external_id
+                JOIN inbox_message_proofs p ON p.conversation_id=m.conversation_id AND p.message_external_id=m.external_id
+                WHERE a.conversation_id=? AND typeof(m.timestamp_ms)='integer'
+                  AND m.timestamp_ms>=1000000000000 AND m.timestamp_ms<10000000000000''',
+                (previous['id'],)).fetchone()[0]
+            baseline_ms = cursor['baseline_ms'] if cursor else anchor_time
+            # Older versions could have stored a newer list timestamp as the cursor.
+            # Bound existing cursors to a previously verified message before comparing.
+            if known_ids and baseline_ms is not None:
+                corrected = min(baseline_ms, anchor_time) if anchor_time is not None else None
+                if cursor and corrected != baseline_ms:
+                    con.execute('UPDATE inbox_alert_cursors SET baseline_ms=? WHERE conversation_id=?',
+                                (corrected, previous['id']))
+                baseline_ms = corrected
+        valid_times = [timestamps[m['external_id']] for m in accepted
+                       if type(timestamps.get(m['external_id'])) is int
+                       and 1_000_000_000_000 <= timestamps[m['external_id']] < 10_000_000_000_000]
         list_timestamp = item.get('_last_timestamp')
         last_timestamp = (list_timestamp if isinstance(list_timestamp, int)
                           and 1_000_000_000_000 <= list_timestamp < 10_000_000_000_000
@@ -551,7 +569,7 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
         _ensure_alert_anchor(con, row['id'])
         initial_baseline = baseline_ms
         if initial_baseline is None and observations is None and accepted:
-            initial_baseline = last_timestamp
+            initial_baseline = max(valid_times) if valid_times else None
         con.execute('INSERT OR IGNORE INTO inbox_alert_cursors(conversation_id,baseline_ms) VALUES(?,?)',
                     (row['id'], initial_baseline))
         new_ids, review = _recent_incoming(observations, accepted, known_ids, timestamps, baseline_ms)
@@ -605,9 +623,15 @@ def _save_conversation(alias, identity, item, messages, timestamps, complete, pa
                                VALUES(?,?)''', [(row['id'], mid) for mid in accepted_ids])
         safe_window = (_observations_complete(observations, accepted_ids) and not unresolved_review and
                        _coverage_complete(observations,known_ids,complete))
-        if safe_window and last_timestamp is not None:
+        newest_id = next((mid for event in observations or [] for mid in event.get('ordered_ids', []) if mid), None)
+        verified_timestamp = timestamps.get(newest_id) if newest_id in accepted_ids else None
+        if (type(verified_timestamp) is not int or
+                not 1_000_000_000_000 <= verified_timestamp < 10_000_000_000_000):
+            verified_timestamp = None
+        if safe_window and verified_timestamp is not None:
             con.execute('''UPDATE inbox_alert_cursors SET baseline_ms=CASE WHEN baseline_ms IS NULL THEN ?
-                       ELSE MAX(baseline_ms,?) END WHERE conversation_id=?''', (last_timestamp,last_timestamp,row['id']))
+                       WHEN ? THEN ? ELSE MAX(baseline_ms,?) END WHERE conversation_id=?''',
+                        (verified_timestamp, not known_ids, verified_timestamp, verified_timestamp, row['id']))
             con.executemany('''INSERT OR IGNORE INTO inbox_alert_anchor_ids(conversation_id,message_external_id)
                                VALUES(?,?)''', [(row['id'], mid) for mid in accepted_ids])
         signature = _list_signature(item)

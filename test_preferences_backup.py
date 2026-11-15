@@ -88,10 +88,64 @@ class PreferencesAndBackupTests(unittest.TestCase):
         claim = app_config.claim_due_sync(now=2800)
         self.assertEqual(claim['aliases'], ['xhs01'])
         self.assertIsNone(app_config.claim_due_sync(now=5000))
-        app_config.finish_sync(claim['token'], 'complete', 'done')
-        self.assertIsNotNone(app_config.claim_due_sync(now=5000))
+        with patch('app_config.time.time',return_value=5000):
+            app_config.finish_sync(claim['token'], 'complete', 'done')
+        self.assertIsNone(app_config.claim_due_sync(now=6799))
+        self.assertIsNotNone(app_config.claim_due_sync(now=6800))
         with self.assertRaises(ValueError):
             app_config.set_interval(True)
+
+    def test_long_queued_sync_waits_a_full_interval_after_finishing(self):
+        with patch('app_config.time.time',return_value=1000):
+            app_config.set_interval(30)
+        claim = app_config.claim_due_sync(now=2800)
+        self.assertIsNone(app_config.claim_due_sync(now=10000))
+        with patch('app_config.time.time',return_value=10000):
+            app_config.finish_sync(claim['token'], 'attention', 'done')
+        self.assertEqual(app_config.settings()['schedule']['next_run'], 11800)
+        self.assertIsNone(app_config.claim_due_sync(now=11799))
+        self.assertIsNotNone(app_config.claim_due_sync(now=11800))
+
+    def test_finishing_obeys_interval_changes_and_ignores_stale_tokens(self):
+        with patch('app_config.time.time',return_value=1000):
+            app_config.set_interval(30)
+        claim = app_config.claim_due_sync(now=2800)
+        with patch('app_config.time.time',return_value=3000):
+            app_config.set_interval(60)
+            app_config.finish_sync('stale-token', 'complete', 'ignored')
+            self.assertEqual(app_config.settings()['schedule']['state'], 'running')
+            app_config.finish_sync(claim['token'], 'complete', 'done')
+        self.assertEqual(app_config.settings()['schedule']['next_run'], 6600)
+        claim = app_config.claim_due_sync(now=6600)
+        with patch('app_config.time.time',return_value=6700):
+            app_config.set_interval(0)
+            app_config.finish_sync(claim['token'], 'cancelled', 'cancelled')
+        self.assertEqual(app_config.settings()['schedule']['next_run'], 0)
+        self.assertIsNone(app_config.claim_due_sync(now=100000))
+
+    def test_interrupted_old_run_is_not_retried_immediately(self):
+        with patch('app_config.time.time',return_value=1000):
+            app_config.set_interval(30)
+        app_config.claim_due_sync(now=2800)
+        with patch('app_config._alive',return_value=False):
+            self.assertIsNone(app_config.claim_due_sync(now=10000))
+        schedule = app_config.settings()['schedule']
+        self.assertEqual(schedule['state'],'interrupted')
+        self.assertEqual(schedule['next_run'],11800)
+        self.assertIsNone(app_config.claim_due_sync(now=11799))
+        self.assertIsNotNone(app_config.claim_due_sync(now=11800))
+
+    def test_orphaned_worker_waits_before_another_attempt(self):
+        with patch('app_config.time.time',return_value=1000):
+            app_config.set_interval(30)
+        app_config.claim_due_sync(now=2800)
+        with patch('app_config.time.time',return_value=10000):
+            app_config.recover_orphaned_run(set())
+        schedule = app_config.settings()['schedule']
+        self.assertEqual(schedule['state'],'attention')
+        self.assertEqual(schedule['next_run'],11800)
+        self.assertIsNone(app_config.claim_due_sync(now=11799))
+        self.assertIsNotNone(app_config.claim_due_sync(now=11800))
 
     def test_scheduler_does_not_silently_skip_accounts_over_limit(self):
         for number in range(2, 12):

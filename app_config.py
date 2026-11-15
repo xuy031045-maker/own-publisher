@@ -60,7 +60,10 @@ def claim_due_sync(now=None):
         if row['state'] == 'running' and row['pid'] and _alive(row['pid'], row['birth']):
             return None
         if row['state'] == 'running':
-            con.execute("UPDATE inbox_schedule SET state='interrupted',detail='上次自动同步中断，请检查账号状态。',pid=NULL,birth=NULL,token=NULL WHERE id=1")
+            con.execute('''UPDATE inbox_schedule SET state='interrupted',detail='上次自动同步中断，请检查账号状态。',
+                           pid=NULL,birth=NULL,token=NULL,next_run=CASE WHEN interval_minutes IN (30,60,120,360)
+                           THEN ? + interval_minutes * 60 ELSE 0 END WHERE id=1''', (now,))
+            return None
         interval = row['interval_minutes']
         if interval not in INTERVALS or not interval or row['next_run'] > now:
             return None
@@ -85,18 +88,24 @@ def claim_due_sync(now=None):
 def finish_sync(token, state, detail):
     if state not in ('complete', 'attention', 'cancelled'):
         raise ValueError('自动同步状态无效。')
+    now = time.time()
     with db() as con:
         _schema(con)
-        con.execute('''UPDATE inbox_schedule SET state=?,detail=?,pid=NULL,birth=NULL,token=NULL,last_finished=?
-                       WHERE id=1 AND token=?''', (state, detail, time.time(), token))
+        con.execute('''UPDATE inbox_schedule SET state=?,detail=?,pid=NULL,birth=NULL,token=NULL,last_finished=?,
+                       next_run=CASE WHEN interval_minutes IN (30,60,120,360)
+                           THEN ? + interval_minutes * 60 ELSE 0 END
+                       WHERE id=1 AND token=?''', (state, detail, now, now, token))
 
 
 def recover_orphaned_run(active_tokens):
     """An in-process worker that ended without recording a result must not stall forever."""
+    now = time.time()
     with db() as con:
         _schema(con)
         row = con.execute('SELECT state,pid,token FROM inbox_schedule WHERE id=1').fetchone()
         if row['state'] == 'running' and row['pid'] == os.getpid() and row['token'] not in active_tokens:
             con.execute('''UPDATE inbox_schedule SET state='attention',
-                           detail='上次自动同步未能记录结果，请检查账号状态。',pid=NULL,birth=NULL,token=NULL
-                           WHERE id=1 AND token=?''',(row['token'],))
+                           detail='上次自动同步未能记录结果，请检查账号状态。',pid=NULL,birth=NULL,token=NULL,
+                           next_run=CASE WHEN interval_minutes IN (30,60,120,360)
+                           THEN ? + interval_minutes * 60 ELSE 0 END
+                           WHERE id=1 AND token=?''',(now,row['token']))
